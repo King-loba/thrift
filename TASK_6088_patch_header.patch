@@ -1,0 +1,21 @@
+--- a/compiler/cpp/src/thrift/generate/t_cpp_generator.cc
++++ b/compiler/cpp/src/thrift/generate/t_cpp_generator.cc
+@@ -205,6 +205,19 @@ class t_cpp_generator : public t_oop_generator {
+   void generate_deserialize_container(std::ostream& out, t_type* ttype, std::string prefix = "");
+
+   void generate_deserialize_set_element(std::ostream& out, t_set* tset, std::string prefix = "");
++
++  /**
++   * Security: Generate container size validation code
++   * Prevents memory exhaustion attacks by checking container sizes before allocation
++   */
++  void generate_container_size_check(std::ostream& out,
++                                      const std::string& size_var,
++                                      const std::string& container_type);
++
++  /**
++   * Security: Get human-readable container type name for error messages
++   */
++  std::string get_container_type_name(t_type* ttype);
+
+   void generate_deserialize_map_element(std::ostream& out, t_map* tmap, std::string prefix = "");

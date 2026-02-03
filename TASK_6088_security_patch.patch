@@ -1,0 +1,133 @@
+--- a/compiler/cpp/src/thrift/generate/t_cpp_generator.cc
++++ b/compiler/cpp/src/thrift/generate/t_cpp_generator.cc
+@@ -43,6 +43,13 @@ using std::string;
+ using std::vector;
+
+ /**
++ * Maximum container size to prevent memory exhaustion attacks.
++ * This is a conservative limit that should handle most legitimate use cases
++ * while preventing denial-of-service through oversized allocations.
++ */
++#define THRIFT_MAX_CONTAINER_SIZE (16 * 1024 * 1024)  // 16M elements
++
++/**
+  * C++ code generator. This is legitimacy incarnate.
+  *
+  */
+@@ -4248,6 +4255,53 @@ void t_cpp_generator::generate_deserialize_struct(ostream& out,
+   }
+ }
+
++/**
++ * Generates container size validation code to prevent memory exhaustion attacks.
++ * This check is inserted before any resize() operation to ensure the size claimed
++ * in the wire protocol is within reasonable bounds.
++ *
++ * @param out       Output stream
++ * @param size_var  Variable name holding the container size from wire protocol
++ * @param container_type  String describing the container (for error messages)
++ */
++void t_cpp_generator::generate_container_size_check(ostream& out,
++                                                      const string& size_var,
++                                                      const string& container_type) {
++  // Generate size validation
++  indent(out) << "if (" << size_var << " > " << THRIFT_MAX_CONTAINER_SIZE << ") {" << '\n';
++  indent_up();
++
++  // Generate detailed error message for debugging
++  indent(out) << "throw ::apache::thrift::protocol::TProtocolException(" << '\n';
++  indent_up();
++  indent(out) << "::apache::thrift::protocol::TProtocolException::SIZE_LIMIT," << '\n';
++  indent(out) << "\"" << container_type << " size exceeds maximum allowed: \" + " << '\n';
++  indent(out) << "std::to_string(" << size_var << ") + \" > \" + " << '\n';
++  indent(out) << "std::to_string(" << THRIFT_MAX_CONTAINER_SIZE << "));" << '\n';
++  indent_down();
++
++  indent_down();
++  indent(out) << "}" << '\n';
++}
++
++/**
++ * Generates a descriptive name for a container type for error messages.
++ * Examples: "list", "set", "map"
++ *
++ * @param ttype  The container type
++ * @return Human-readable container type name
++ */
++string t_cpp_generator::get_container_type_name(t_type* ttype) {
++  if (ttype->is_map()) {
++    return "map";
++  } else if (ttype->is_set()) {
++    return "set";
++  } else if (ttype->is_list()) {
++    return "list";
++  }
++  return "container";
++}
++
+ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttype, string prefix) {
+   scope_up(out);
+
+@@ -4262,16 +4316,36 @@ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttyp
+
+   // Declare variables, read header
+   if (ttype->is_map()) {
++    // Read map header
+     out << indent() << "::apache::thrift::protocol::TType " << ktype << ";" << '\n' << indent()
+         << "::apache::thrift::protocol::TType " << vtype << ";" << '\n' << indent()
+         << "xfer += iprot->readMapBegin(" << ktype << ", " << vtype << ", " << size << ");" << '\n';
++
++    // SECURITY FIX: Validate map size before allocating memory
++    generate_container_size_check(out, size, "Map");
++
+   } else if (ttype->is_set()) {
++    // Read set header
+     out << indent() << "::apache::thrift::protocol::TType " << etype << ";" << '\n' << indent()
+         << "xfer += iprot->readSetBegin(" << etype << ", " << size << ");" << '\n';
++
++    // SECURITY FIX: Validate set size before allocating memory
++    generate_container_size_check(out, size, "Set");
++
+   } else if (ttype->is_list()) {
++    // Read list header
+     out << indent() << "::apache::thrift::protocol::TType " << etype << ";" << '\n' << indent()
+         << "xfer += iprot->readListBegin(" << etype << ", " << size << ");" << '\n';
++
++    // SECURITY FIX: Validate list size before calling resize()
++    // This prevents memory exhaustion attacks where an attacker sends a malicious
++    // payload claiming billions of elements but doesn't actually send the data.
++    // Without this check, resize() would attempt to allocate huge amounts of memory,
++    // leading to std::bad_alloc and process crash (DoS).
++    generate_container_size_check(out, size, "List");
++
++    // Only resize after validation passes
+     if (!use_push) {
++      // Now safe to resize - we know size is within bounds
+       indent(out) << prefix << ".resize(" << size << ");" << '\n';
+     }
+   }
+@@ -4280,6 +4354,16 @@ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttyp
+   string i = tmp("_i");
+   out << indent() << "uint32_t " << i << ";" << '\n' << indent() << "for (" << i << " = 0; " << i
+       << " < " << size << "; ++" << i << ")" << '\n';
++
++  // Optional: Add runtime bounds check in loop
++  // This is defense-in-depth in case size changes during deserialization
++  scope_up(out);
++  indent(out) << "if (" << i << " >= " << THRIFT_MAX_CONTAINER_SIZE << ") {" << '\n';
++  indent_up();
++  indent(out) << "throw ::apache::thrift::protocol::TProtocolException(" << '\n';
++  indent(out) << "  ::apache::thrift::protocol::TProtocolException::SIZE_LIMIT);" << '\n';
++  indent_down();
++  indent(out) << "}" << '\n';
+
+   scope_up(out);
+
+@@ -4293,6 +4377,7 @@ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttyp
+
+   scope_down(out);
+
++  scope_down(out);  // Close bounds check scope
+   // Read container end
+   if (ttype->is_map()) {
+     indent(out) << "xfer += iprot->readMapEnd();" << '\n';

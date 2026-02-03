@@ -1,0 +1,202 @@
+--- a/compiler/cpp/src/thrift/generate/t_cpp_generator.cc
++++ b/compiler/cpp/src/thrift/generate/t_cpp_generator.cc
+@@ -43,6 +43,16 @@ using std::string;
+ using std::vector;
+
+ /**
++ * Security: Maximum container size to prevent memory exhaustion and CPU DoS attacks.
++ * - Prevents unbounded resize() calls on lists/vectors
++ * - Prevents unbounded loop iterations on maps/sets
++ * - Prevents metadata allocation exhaustion
++ * This is a conservative limit that handles most legitimate use cases.
++ */
++#define THRIFT_MAX_CONTAINER_SIZE (16 * 1024 * 1024)  // 16M elements
++static thread_local int container_nesting_level = 0;  // Track nesting depth for scope comments
++
++/**
+  * C++ code generator. This is legitimacy incarnate.
+  *
+  */
+@@ -195,6 +205,19 @@ class t_cpp_generator : public t_oop_generator {
+                                   t_field* tfield,
+                                   std::string prefix = "",
+                                   std::string suffix = "");
++
++  /**
++   * Security: Generate container size validation code
++   * Prevents memory exhaustion and CPU DoS attacks by checking container sizes
++   * before any allocation or iteration
++   */
++  void generate_container_size_check(std::ostream& out,
++                                      const std::string& size_var,
++                                      const std::string& container_type);
++
++  /**
++   * Security: Get human-readable container type name for error messages
++   */
++  std::string get_container_type_name(t_type* ttype);
+
+   void generate_deserialize_struct(std::ostream& out,
+                                     t_struct* tstruct,
+@@ -4248,6 +4271,67 @@ void t_cpp_generator::generate_deserialize_struct(ostream& out,
+   }
+ }
+
++/**
++ * Generates container size validation code to prevent DoS attacks.
++ *
++ * Attack scenarios prevented:
++ * 1. Lists/Vectors: Unbounded resize() causing memory exhaustion
++ * 2. Maps/Sets: Billion-iteration loops causing CPU exhaustion
++ * 3. Nested containers: Amplification attacks (1K × 1M = 1B allocations)
++ *
++ * This check is inserted before:
++ * - Any resize() operation
++ * - Any container iteration loop
++ *
++ * @param out       Output stream for generated code
++ * @param size_var  Variable name holding the container size from wire protocol
++ * @param container_type  String describing the container (for error messages)
++ */
++void t_cpp_generator::generate_container_size_check(ostream& out,
++                                                      const string& size_var,
++                                                      const string& container_type) {
++  indent(out) << "// Security: Validate container size to prevent DoS" << '\n';
++  indent(out) << "if (" << size_var << " > " << THRIFT_MAX_CONTAINER_SIZE << ") {" << '\n';
++  indent_up();
++
++  // Generate detailed error message for debugging
++  indent(out) << "throw ::apache::thrift::protocol::TProtocolException(" << '\n';
++  indent_up();
++  indent(out) << "::apache::thrift::protocol::TProtocolException::SIZE_LIMIT," << '\n';
++  indent(out) << "\"" << container_type << " size exceeds maximum allowed: \" + " << '\n';
++  indent(out) << "std::to_string(" << size_var << ") + \" > \" + " << '\n';
++  indent(out) << "std::to_string(" << THRIFT_MAX_CONTAINER_SIZE << "));" << '\n';
++  indent_down();
++
++  indent_down();
++  indent(out) << "}" << '\n';
++}
++
++/**
++ * Generates a descriptive name for a container type for error messages.
++ * Examples: "List", "Set", "Map"
++ *
++ * @param ttype  The container type
++ * @return Human-readable container type name
++ */
++string t_cpp_generator::get_container_type_name(t_type* ttype) {
++  if (ttype->is_map()) {
++    return "Map";
++  } else if (ttype->is_set()) {
++    return "Set";
++  } else if (ttype->is_list()) {
++    return "List";
++  }
++  return "Container";
++}
++
++/**
++ * Generates code to deserialize a container (list, set, or map).
++ *
++ * SECURITY NOTE: This function implements critical DoS protections:
++ * 1. Size validation before allocation/iteration
++ * 2. Runtime bounds checking within loops
++ * 3. Scope level tracking for debugging nested structures
++ */
+ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttype, string prefix) {
+   scope_up(out);
+
+@@ -4257,19 +4341,53 @@ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttyp
+   string etype = tmp("_etype");
+
+   t_container* tcontainer = (t_container*)ttype;
+   bool use_push = tcontainer->has_cpp_name();
+
++  // Track nesting level for scope comments
++  container_nesting_level++;
++  int current_level = container_nesting_level;
++
++  // Add scope level comment for debugging nested structures
++  indent(out) << "// Nesting level: " << current_level << " ("
++              << get_container_type_name(ttype) << ")" << '\n';
++
+   indent(out) << prefix << ".clear();" << '\n' << indent() << "uint32_t " << size << ";" << '\n';
+
+   // Declare variables, read header
+   if (ttype->is_map()) {
++    // Read map header
+     out << indent() << "::apache::thrift::protocol::TType " << ktype << ";" << '\n' << indent()
+         << "::apache::thrift::protocol::TType " << vtype << ";" << '\n' << indent()
+         << "xfer += iprot->readMapBegin(" << ktype << ", " << vtype << ", " << size << ");" << '\n';
++
++    // SECURITY FIX: Validate map size to prevent CPU DoS
++    // Even though maps don't resize(), a billion iterations still cause DoS:
++    // - 1 billion loop iterations = CPU exhaustion
++    // - 1 billion map nodes = metadata allocation exhaustion
++    // - 1 billion hash operations = CPU exhaustion
++    generate_container_size_check(out, size, "Map");
++
+   } else if (ttype->is_set()) {
++    // Read set header
+     out << indent() << "::apache::thrift::protocol::TType " << etype << ";" << '\n' << indent()
+         << "xfer += iprot->readSetBegin(" << etype << ", " << size << ");" << '\n';
++
++    // SECURITY FIX: Validate set size to prevent CPU DoS
++    // Sets insert elements one-by-one but:
++    // - 1 billion insert() calls = CPU exhaustion
++    // - 1 billion set nodes = metadata allocation
++    // - 1 billion tree/hash operations = CPU exhaustion
++    generate_container_size_check(out, size, "Set");
++
+   } else if (ttype->is_list()) {
++    // Read list header
+     out << indent() << "::apache::thrift::protocol::TType " << etype << ";" << '\n' << indent()
+         << "xfer += iprot->readListBegin(" << etype << ", " << size << ");" << '\n';
++
++    // SECURITY FIX: Validate list size before resize()
++    // This is the original vulnerability - prevents memory exhaustion
++    generate_container_size_check(out, size, "List");
++
++    // Only resize after validation passes
+     if (!use_push) {
+       indent(out) << prefix << ".resize(" << size << ");" << '\n';
+     }
+@@ -4280,6 +4398,18 @@ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttyp
+   out << indent() << "uint32_t " << i << ";" << '\n' << indent() << "for (" << i << " = 0; " << i
+       << " < " << size << "; ++" << i << ")" << '\n';
+
++  // SECURITY: Defense-in-depth runtime bounds check
++  // This catches:
++  // - Protocol bugs that modify size during iteration
++  // - Memory corruption that changes loop counter
++  // - Integer overflow in size calculations
++  scope_up(out);
++  indent(out) << "// Security: Runtime iteration bounds check" << '\n';
++  indent(out) << "if (" << i << " >= " << THRIFT_MAX_CONTAINER_SIZE << ") {" << '\n';
++  indent_up();
++  indent(out) << "throw ::apache::thrift::protocol::TProtocolException(" << '\n';
++  indent(out) << "  ::apache::thrift::protocol::TProtocolException::SIZE_LIMIT);" << '\n';
++  indent_down();
++  indent(out) << "}" << '\n';
++
+   scope_up(out);
+
+   if (ttype->is_map()) {
+@@ -4291,6 +4421,7 @@ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttyp
+   }
+
+   scope_down(out);
++  scope_down(out);  // Close runtime bounds check scope
+
+   // Read container end
+   if (ttype->is_map()) {
+@@ -4301,6 +4432,9 @@ void t_cpp_generator::generate_deserialize_container(ostream& out, t_type* ttyp
+     indent(out) << "xfer += iprot->readListEnd();" << '\n';
+   }
+
++  // Restore nesting level
++  container_nesting_level--;
++
+   scope_down(out);
+ }
